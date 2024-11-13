@@ -101,24 +101,24 @@ class YoloHead(nn.Module):
         B = x.shape[0]
         # B, H, W, C = x.shape
         act = nn.activation.silu
-        # Layer 5
-        x = act(
-                nn.Sequential([
-                    nn.Conv(512, (1,1)),
-                    nn.Conv(1024, (3,3)),
-                    nn.Conv(1024, (3,3)),
-                    nn.Conv(1024, (3,3), strides=(2,2)),
-                    ])(x)
-                )
-
+        # # Layer 5
+        # x = act(
+        #         nn.Sequential([
+        #             nn.Conv(512, (1,1)),
+        #             nn.Conv(1024, (3,3)),
+        #             nn.Conv(1024, (3,3)),
+        #             nn.Conv(1024, (3,3), strides=(2,2)),
+        #             ])(x)
+        #         )
+        #
         # Layer 6
-        x = act(
-                nn.Sequential([
-                    nn.Conv(1024, (3,3)),
-                    nn.Conv(1024, (3,3))
-                    ])(x)
-                )
-
+        # x = act(
+        #         nn.Sequential([
+        #             nn.Conv(1024, (3,3)),
+        #             nn.Conv(1024, (3,3))
+        #             ])(x)
+        #         )
+        #
         # Layer 7
         x = act(nn.Dense(4096)(jnp.reshape(x, (B, -1))))
         
@@ -128,35 +128,23 @@ class YoloHead(nn.Module):
 
     def yolo_loss(self, Y, Y_hat, lam_coord=5, lam_noobj=.5, epsilon=1e-5):
         B = Y_hat.shape[0]
-        # jax.debug.print("Y_hat isnan {}", jnp.any(jnp.isnan(Y_hat)))
         box_actual, class_actual = Y[...,None, :4], Y[...,4:]
         box_pred, class_pred = Y_hat[...,:(5*self.n_box)].reshape((B, self.region_dim**2, self.n_box, 5)), Y_hat[...,(5*self.n_box):]
         box_pred, confidence = box_pred[..., :4], box_pred[..., 4]
         sq_err = lambda a, b: (a-b)**2
         posn_err = lambda x, x_pred, y, y_pred: sq_err(x,x_pred) + sq_err(y,y_pred)
         dim_err = lambda w, w_pred, h, h_pred: sq_err(jnp.sqrt(jnp.maximum(w,epsilon)),jnp.sqrt(jnp.maximum(w_pred,epsilon))) + sq_err(jnp.sqrt(jnp.maximum(h,epsilon)),jnp.sqrt(jnp.maximum(h_pred,epsilon)))
-        # class_pred_choice = jax.nn.softmax(class_pred, axis=-1)
-        # jax.debug.print("softmax {}", class_pred_choice)
-        class_pred_choice = jax.lax.stop_gradient(jax.nn.one_hot(jnp.argmax(class_pred, axis=-1), self.n_class))
+        class_pred_choice = jax.nn.one_hot(jnp.argmax(class_pred, axis=-1), self.n_class)
         predict_object = jnp.any(class_pred_choice*class_actual, axis=-1, keepdims=True)
-        # jax.debug.print("predict_object {}", jnp.mean(predict_object))
-        predictor = jax.lax.stop_gradient(box_nms(box_actual, box_pred))
-        # jax.debug.print("class_choice {}", jnp.any(jnp.isnan(class_choice)))
-        # jax.debug.print("predictor_object {}", jnp.any(jnp.isnan(predict_object)))
-        # jax.debug.print("predictor {}", predictor.shape)
+        predictor = box_nms(box_actual, box_pred)
         l1 = lam_coord * jnp.sum(predictor * posn_err(box_pred[...,0], box_actual[..., 0], box_pred[...,1], box_actual[...,1]), axis=(1,2)) 
         l2 = lam_coord * jnp.sum(predictor * dim_err(box_pred[..., 2], box_actual[..., 2], box_pred[..., 3], box_actual[..., 3]), axis=(1,2))
         l3 = jnp.sum(jnp.expand_dims(predictor, -1) * jnp.expand_dims(sq_err(class_pred, class_actual), axis=2), axis=(1,2,3))
         l4 = lam_noobj * jnp.sum((~predictor)[...,None] * jnp.expand_dims(sq_err(class_pred, class_actual), axis=2), axis=(1,2,3))
         l5  = lam_coord * jnp.sum(predict_object * sq_err(confidence, box_iou(xywh2abcd(box_pred), xywh2abcd(box_actual))), axis=(1,2))
-        # jax.debug.print("coordinate loss {}", jnp.any(jnp.isnan(l1)))
-        # jax.debug.print("shape loss {}", jnp.any(jnp.isnan(l2)))
-        # jax.debug.print("classification loss (responsible) {}", jnp.any(jnp.isnan(l3)))
-        # jax.debug.print("classification loss (other) {}", jnp.any(jnp.isnan(l4)))
-        # jax.debug.print("object accuracy loss {}", jnp.any(jnp.isnan(l5)))
         return jnp.sum(l1 + l2 + l3 + l4 + l5)
 
-def train(region_dim=7, lr=1e-1, batch_size=8, epochs=4, epoch_steps=1000):
+def train(region_dim=7, lr=1e-3, batch_size=16, epochs=4, epoch_steps=10000):
     key = jax.random.key(seed=42)
     x_0 = jnp.ones((1, 640, 640, 3))
     #initialize resnet backbone 
@@ -169,7 +157,7 @@ def train(region_dim=7, lr=1e-1, batch_size=8, epochs=4, epoch_steps=1000):
     # last_block_shape= activations['block4_1'].shape
     backbone = lambda image: resnet.apply(resnet_params, image, train=False)
 
-    h_0 = jax.random.uniform(key, 1000)
+    h_0 = jax.random.uniform(key, (batch_size, 1000))
     head = YoloHead(region_dim=region_dim)
     params = head.init(key, h_0)
     print(head.tabulate(key, h_0, compute_flops=True))
@@ -208,9 +196,9 @@ def train(region_dim=7, lr=1e-1, batch_size=8, epochs=4, epoch_steps=1000):
     def step(params, opt_state, image, labels):
         loss_grad = jax.value_and_grad(loss_fn)
         loss_value, grad = loss_grad(params, image, labels)
-        print(grad)
-        # updates, opt_state = optimizer.update(grad, opt_state)
-        # params = optax.apply_updates(params, updates)
+        jax.debug.print("grad {}", grad)
+        updates, opt_state = optimizer.update(grad, opt_state)
+        params = optax.apply_updates(params, updates)
         return params, opt_state, loss_value
         
 
