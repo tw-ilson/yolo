@@ -15,4 +15,5 @@ dependencies = [
     "polars>=1.12.0",
     "opencv-python>=4.10.0.84",
     "pillow>=11.0.0",
+    "matplotlib>=3.9.2",
 ]

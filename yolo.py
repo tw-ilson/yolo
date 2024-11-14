@@ -1,5 +1,3 @@
-import math
-from types import new_class
 import numpy as np
 import jax
 from jax import numpy as jnp
@@ -11,6 +9,7 @@ import flaxmodels
 import polars as pl
 from tqdm import tqdm
 import cv2
+import matplotlib.pyplot as plt
 
 # jax.profiler.start_trace("/tmp/tensorboard")
 
@@ -99,29 +98,26 @@ class YoloHead(nn.Module):
     @nn.compact
     def __call__(self, x):
         B = x.shape[0]
-        # B, H, W, C = x.shape
         act = nn.activation.silu
-        # # Layer 5
-        # x = act(
-        #         nn.Sequential([
-        #             nn.Conv(512, (1,1)),
-        #             nn.Conv(1024, (3,3)),
-        #             nn.Conv(1024, (3,3)),
-        #             nn.Conv(1024, (3,3), strides=(2,2)),
-        #             ])(x)
-        #         )
-        #
+        # Layer 5
+        x = act(
+                nn.Sequential([
+                    nn.Conv(256, (1,1)),
+                    nn.Conv(512, (3,3)),
+                    nn.Conv(512, (3,3)),
+                    nn.Conv(512, (3,3), strides=(2,2)),
+                    ])(x)
+                )
+
         # Layer 6
-        # x = act(
-        #         nn.Sequential([
-        #             nn.Conv(1024, (3,3)),
-        #             nn.Conv(1024, (3,3))
-        #             ])(x)
-        #         )
-        #
-        # Layer 7
-        x = act(nn.Dense(4096)(jnp.reshape(x, (B, -1))))
-        
+        x = act(
+                nn.Sequential([
+                    nn.Conv(512, (3,3)),
+                    nn.Conv(512, (3,3))
+                    ])(x)
+                )
+        x = jnp.reshape(x, (B, -1))
+        x = act(nn.Dense(2048)(x))
         # Output Layer
         x = jnp.reshape(nn.Dense(self.output_dim)(x), (B, self.region_dim*self.region_dim, self.feature_dim))
         return x
@@ -139,28 +135,29 @@ class YoloHead(nn.Module):
         predictor = box_nms(box_actual, box_pred)
         l1 = lam_coord * jnp.sum(predictor * posn_err(box_pred[...,0], box_actual[..., 0], box_pred[...,1], box_actual[...,1]), axis=(1,2)) 
         l2 = lam_coord * jnp.sum(predictor * dim_err(box_pred[..., 2], box_actual[..., 2], box_pred[..., 3], box_actual[..., 3]), axis=(1,2))
-        l3 = jnp.sum(jnp.expand_dims(predictor, -1) * jnp.expand_dims(sq_err(class_pred, class_actual), axis=2), axis=(1,2,3))
-        l4 = lam_noobj * jnp.sum((~predictor)[...,None] * jnp.expand_dims(sq_err(class_pred, class_actual), axis=2), axis=(1,2,3))
+        l3 = jnp.sum(predictor * jnp.expand_dims(optax.safe_softmax_cross_entropy(class_pred, class_actual), axis=2), axis=(1,2))
+        l4 = lam_noobj * jnp.sum(~predictor * jnp.expand_dims(optax.safe_softmax_cross_entropy(class_pred, class_actual), axis=2), axis=(1,2))
         l5  = lam_coord * jnp.sum(predict_object * sq_err(confidence, box_iou(xywh2abcd(box_pred), xywh2abcd(box_actual))), axis=(1,2))
         return jnp.sum(l1 + l2 + l3 + l4 + l5)
 
-def train(region_dim=7, lr=1e-3, batch_size=16, epochs=4, epoch_steps=10000):
+def train(region_dim=7, lr=1e-3, batch_size=8, epochs=1, epoch_steps=10000):
     key = jax.random.key(seed=42)
     x_0 = jnp.ones((1, 640, 640, 3))
     #initialize resnet backbone 
     print("obtaining pretrained weights...")
-    resnet = flaxmodels.ResNet18(output='logits', pretrained='imagenet')
+    resnet = flaxmodels.ResNet18(output='activations', pretrained='imagenet')
     resnet_params = resnet.init(key, x_0)
     # print(resnet.tabulate(key, x_0, compute_flops=True))
     activations = resnet.apply(resnet_params, x_0, train=False)
     # print(activations.keys())
-    # last_block_shape= activations['block4_1'].shape
+    last_block_shape= activations['block4_1'].shape
     backbone = lambda image: resnet.apply(resnet_params, image, train=False)
 
-    h_0 = jax.random.uniform(key, (batch_size, 1000))
-    head = YoloHead(region_dim=region_dim)
+    h_0 = jax.random.uniform(key, last_block_shape)
+    head = YoloHead(region_dim=region_dim, n_box=5)
     params = head.init(key, h_0)
-    print(head.tabulate(key, h_0, compute_flops=True))
+    # print(head.tabulate(key, h_0, compute_flops=True))
+    # exit()
 
     print("obtaining data...")
     splits = {'train': 'data/train-00000-of-00001-83ef17440fd25f6f.parquet', 'validation': 'data/validation-00000-of-00001-876de533d76d48c6.parquet', 'test': 'data/test-00000-of-00001-77e7809ef7ac5cc0.parquet'}
@@ -186,7 +183,7 @@ def train(region_dim=7, lr=1e-3, batch_size=16, epochs=4, epoch_steps=10000):
         return jnp.stack(image_batch), jnp.stack(objects_batch)
 
     def loss_fn(params, image, objects):
-        features = jax.lax.stop_gradient(backbone(image))
+        features = jax.lax.stop_gradient(backbone(image))['block4_1']
         output_features = head.apply(params, features)
         loss_value = head.yolo_loss(objects, output_features)
         # jax.debug.print("loss value {}", loss_value)
@@ -196,11 +193,13 @@ def train(region_dim=7, lr=1e-3, batch_size=16, epochs=4, epoch_steps=10000):
     def step(params, opt_state, image, labels):
         loss_grad = jax.value_and_grad(loss_fn)
         loss_value, grad = loss_grad(params, image, labels)
-        jax.debug.print("grad {}", grad)
+        # jax.debug.print("grad {}", grad)
         updates, opt_state = optimizer.update(grad, opt_state)
         params = optax.apply_updates(params, updates)
         return params, opt_state, loss_value
         
+    # print(loss_fn(params, x_0, jax.random.uniform(key, (batch_size, region_dim**2, 4+head.n_class))))
+    # exit()
 
     optimizer = optax.adam(lr)
     opt_state = optimizer.init(params)
@@ -208,12 +207,17 @@ def train(region_dim=7, lr=1e-3, batch_size=16, epochs=4, epoch_steps=10000):
     for ep in range(epochs):
         print(f"---- Epoch {ep} ----")
         pbar = tqdm(range(epoch_steps))
-        for _ in pbar:
+        losses = []
+        for episode in pbar:
             x = df.sample(n=batch_size, shuffle=True)
             image_batch, object_batch = prepare_batch(x)
             params, opt_state, loss_value = step(params, opt_state, image_batch, object_batch)
 
             jax.debug.print('Loss: {}', loss_value)
+            if episode % 20: 
+                losses.append(np.log(loss_value))
+        plt.plot(losses)
+        plt.show()
 
 
 def load_safetensors(model):
@@ -223,7 +227,6 @@ def load_safetensors(model):
             tensors[key] = f.get_tensor(key)
     return tensors
 
-# jax.config.update('jax_platform_name', 'cpu')
 jax.config.update("jax_debug_nans", True)
 
 def main():
